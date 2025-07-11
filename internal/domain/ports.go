@@ -1,9 +1,13 @@
 package domain
 
+import "context"
+
 type ExchangePort interface {
 	Connect() error
-	ReadPriceUpdates() (<-chan Message, <-chan error)
 	Close() error
+	ReadPriceUpdates(ctx context.Context) (<-chan Message, <-chan error)
+	IsConnected() bool
+	Name() string
 }
 
 type StoragePort interface {
