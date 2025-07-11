@@ -4,21 +4,47 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
 
-type massage struct {
+type message struct {
 	Symbol    string
 	Price     float64
 	Timestamp time.Time
 }
 
-func parseString(s string) {
-	fmt.Printf("Cтрока %s\n", s)
-	words := strings.Split(s, ",")
-	symbol := strings.Fields(words[0])
-	fmt.Println(symbol[0])
+func parseString(s string) (message, error) {
+	m := message{}
+	cleaned := strings.Trim(s, "{}")
+	pairs := strings.Split(cleaned, ",")
+	for _, pair := range pairs {
+		parts := strings.SplitN(pair, ":", 2)
+
+		key := strings.Trim(parts[0], `"`)
+		value := strings.Trim(parts[1], `"`)
+		switch key {
+		case "symbol":
+			m.Symbol = value
+
+		case "price":
+			f, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return m, fmt.Errorf("invalid pair: %s", pair)
+			}
+			m.Price = f
+		case "timestamp":
+			clean := strings.Trim(value, "\"}\n")
+			ms, err := strconv.ParseInt(clean, 10, 64)
+			if err != nil {
+				return m, fmt.Errorf("invalid pair: %s", pair)
+			}
+			t := time.UnixMilli(ms)
+			m.Timestamp = t
+		}
+	}
+	return m, nil
 }
 
 func main() {
@@ -28,12 +54,15 @@ func main() {
 		return
 	}
 	defer conn.Close()
+	for {
+		reader := bufio.NewReader(conn)
+		dateString, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("Ошибка dateString: %v\n", err)
+			return
+		}
 
-	reader := bufio.NewReader(conn)
-	dateString, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Printf("Ошибка dateString: %v\n", err)
-		return
+		message, _ := parseString(dateString)
+		fmt.Println(message)
 	}
-	parseString(dateString)
 }
