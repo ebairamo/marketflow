@@ -3,20 +3,15 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"marketflow/internal/domain"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type message struct {
-	Symbol    string
-	Price     float64
-	Timestamp time.Time
-}
-
-func parseString(s string) (message, error) {
-	m := message{}
+func parseString(s string) (domain.Message, error) {
+	m := domain.Message{}
 	cleaned := strings.Trim(s, "{}")
 	pairs := strings.Split(cleaned, ",")
 	for _, pair := range pairs {
@@ -48,21 +43,30 @@ func parseString(s string) (message, error) {
 }
 
 func main() {
-	conn, err := net.Dial("tcp", "127.0.0.1:40101")
-	if err != nil {
-		fmt.Println("Ошибка подключения:", err)
-		return
-	}
-	defer conn.Close()
 	for {
-		reader := bufio.NewReader(conn)
-		dateString, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Printf("Ошибка dateString: %v\n", err)
-			return
-		}
 
-		message, _ := parseString(dateString)
-		fmt.Println(message)
+		conn, err := net.Dial("tcp", "127.0.0.1:40101")
+		if err != nil {
+			fmt.Println("Ошибка подключения:", err)
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		reader := bufio.NewReader(conn)
+		fmt.Println("Подключено к бирже, начинаем чтение данных")
+		for {
+
+			dataString, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Ошибка dateString: %v\n", err)
+				break
+			}
+
+			message, err := parseString(dataString)
+			if err != nil {
+				fmt.Printf("Ошибка парсинга: %v, строка: %s\n", err, dataString)
+				continue
+			}
+			fmt.Println(message)
+		}
 	}
 }
