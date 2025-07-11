@@ -6,4 +6,5 @@ type Message struct {
 	Symbol    string
 	Price     float64
 	Timestamp time.Time
+	Exchange  string
 }
