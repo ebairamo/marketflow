@@ -1,72 +1,49 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
+	"context"
+	"marketflow/internal/adapters/exchange"
+	"marketflow/internal/application/services"
 	"marketflow/internal/domain"
-	"net"
-	"strconv"
-	"strings"
+	"marketflow/pkg/logger"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
-func parseString(s string) (domain.Message, error) {
-	m := domain.Message{}
-	cleaned := strings.Trim(s, "{}")
-	pairs := strings.Split(cleaned, ",")
-	for _, pair := range pairs {
-		parts := strings.SplitN(pair, ":", 2)
-
-		key := strings.Trim(parts[0], `"`)
-		value := strings.Trim(parts[1], `"`)
-		switch key {
-		case "symbol":
-			m.Symbol = value
-
-		case "price":
-			f, err := strconv.ParseFloat(value, 64)
-			if err != nil {
-				return m, fmt.Errorf("invalid pair: %s", pair)
-			}
-			m.Price = f
-		case "timestamp":
-			clean := strings.Trim(value, "\"}\n")
-			ms, err := strconv.ParseInt(clean, 10, 64)
-			if err != nil {
-				return m, fmt.Errorf("invalid pair: %s", pair)
-			}
-			t := time.UnixMilli(ms)
-			m.Timestamp = t
-		}
-	}
-	return m, nil
-}
-
 func main() {
+	log := logger.SetupLogger()
+	log.Info("Начинаем работу криптобиржи...")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	exchange1 := exchange.NewTCPExchange("127.0.0.1:40101", "Exchange1", log)
+
+	marketService := services.NewMarketService([]domain.ExchangePort{exchange1}, log)
+
+	messageCh, errCh := marketService.Start(ctx)
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 	for {
+		select {
+		case msg := <-messageCh:
+			log.Info("Получено сообщение",
+				"exchange", msg.Exchange,
+				"symbol", msg.Symbol,
+				"price", msg.Price)
 
-		conn, err := net.Dial("tcp", "127.0.0.1:40101")
-		if err != nil {
-			fmt.Println("Ошибка подключения:", err)
-			time.Sleep(3 * time.Second)
-			continue
-		}
-		reader := bufio.NewReader(conn)
-		fmt.Println("Подключено к бирже, начинаем чтение данных")
-		for {
+		case err := <-errCh:
+			log.Error("Получена ошибка", "error", err)
 
-			dataString, err := reader.ReadString('\n')
-			if err != nil {
-				fmt.Printf("Ошибка dateString: %v\n", err)
-				break
-			}
+		case <-signalCh:
+			log.Info("Получен сигнал завершения, останавливаем приложение...")
+			cancel() // Отменяем контекст
 
-			message, err := parseString(dataString)
-			if err != nil {
-				fmt.Printf("Ошибка парсинга: %v, строка: %s\n", err, dataString)
-				continue
-			}
-			fmt.Println(message)
+			time.Sleep(500 * time.Millisecond)
+			return
 		}
 	}
 }
