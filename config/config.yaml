@@ -1,0 +1,24 @@
+postgres:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: postgres
+  database: marketflow
+  sslmode: disable
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+
+exchanges:
+  - name: Exchange1
+    address: 127.0.0.1:40101
+  - name: Exchange2
+    address: 127.0.0.1:40102
+  - name: Exchange3
+    address: 127.0.0.1:40103
+
+api:
+  port: 8080

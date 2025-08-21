@@ -14,7 +14,7 @@ import (
 
 type TCPExchange struct {
 	address  string
-	exchange string // Идентификатор биржи
+	exchange string
 	conn     net.Conn
 	logger   *slog.Logger
 }
@@ -25,27 +25,27 @@ func parseString(s string) (domain.Message, error) {
 	pairs := strings.Split(cleaned, ",")
 	for _, pair := range pairs {
 		parts := strings.SplitN(pair, ":", 2)
-
+		if len(parts) != 2 {
+			continue
+		}
 		key := strings.Trim(parts[0], `"`)
 		value := strings.Trim(parts[1], `"`)
 		switch key {
 		case "symbol":
 			m.Symbol = value
-
 		case "price":
 			f, err := strconv.ParseFloat(value, 64)
 			if err != nil {
-				return m, fmt.Errorf("invalid pair: %s", pair)
+				return m, fmt.Errorf("invalid price: %s", value)
 			}
 			m.Price = f
 		case "timestamp":
 			clean := strings.Trim(value, "\"}\n")
 			ms, err := strconv.ParseInt(clean, 10, 64)
 			if err != nil {
-				return m, fmt.Errorf("invalid pair: %s", pair)
+				return m, fmt.Errorf("invalid timestamp: %s", clean)
 			}
-			t := time.UnixMilli(ms)
-			m.Timestamp = t
+			m.Timestamp = time.UnixMilli(ms)
 		}
 	}
 	return m, nil
@@ -80,103 +80,119 @@ func (e *TCPExchange) Connect() error {
 	return nil
 }
 
-// Close закрывает соединение с биржей
 func (e *TCPExchange) Close() error {
 	if e.conn != nil {
 		e.conn.Close()
-		e.logger.Info("Соединение закрыто")
+		e.logger.Info("Соединение закрыто", "exchange", e.Name())
 		e.conn = nil
-	} else {
-		return nil
 	}
 	return nil
 }
 
-// ReadPriceUpdates читает обновления цен с биржи
-// Возвращает канал с сообщениями и канал с ошибками
 func (e *TCPExchange) ReadPriceUpdates(ctx context.Context) (<-chan domain.Message, <-chan error) {
 	messageCh := make(chan domain.Message, 100)
 	errCh := make(chan error, 10)
+
 	go func() {
 		defer func() {
 			close(messageCh)
 			close(errCh)
 		}()
+
 		if e.conn == nil {
 			err := fmt.Errorf("соединение не установлено для биржи %s", e.Name())
-
-			errCh <- err
-			e.logger.Error("Ошибка соединения", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case errCh <- err:
+				e.logger.Error("Ошибка соединения", "error", err)
+			}
 
 			if err := e.Connect(); err != nil {
-				errCh <- fmt.Errorf("не удалось подключиться: %w", err)
-				// Закрываем каналы и завершаем горутину, так как без соединения нет смысла продолжать
-				close(messageCh)
-				close(errCh)
+				select {
+				case <-ctx.Done():
+					return
+				case errCh <- fmt.Errorf("не удалось подключиться: %w", err):
+				}
 				return
 			}
 		}
+
 		reader := bufio.NewReader(e.conn)
-		e.logger.Info("Подключено к бирже, начинаем чтение данных")
+		e.logger.Info("Подключено к бирже, начинаем чтение данных", "exchange", e.Name())
+
 		for {
 			select {
 			case <-ctx.Done():
-				e.logger.Info("Остановка чтения данных по запросу контекста")
+				e.logger.Info("Остановка чтения данных по запросу контекста", "exchange", e.Name())
 				return
 			default:
-
 				dataString, err := reader.ReadString('\n')
 				if err != nil {
-					// Отправить ошибку в канал
-					errCh <- err
+					select {
+					case <-ctx.Done():
+						return
+					case errCh <- err:
+						e.logger.Error("Ошибка чтения", "error", err, "exchange", e.Name())
+					}
 
-					// Логировать ошибку
-					e.logger.Error("Ошибка чтения", "error", err)
-
-					// Закрыть текущее соединение
 					e.conn.Close()
 					e.conn = nil
 
-					// Попытка переподключения
-					if err := e.Connect(); err != nil {
-						// Если не удалось переподключиться
-						errCh <- fmt.Errorf("не удалось переподключиться: %w", err)
+					// После e.conn.Close() и e.conn = nil
+					// ПЕРЕД попыткой переподключения добавьте:
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						// Продолжаем с переподключением
+
+						if err := e.Connect(); err != nil {
+							select {
+							case <-ctx.Done():
+								return
+							case errCh <- fmt.Errorf("не удалось переподключиться: %w", err):
+							}
+							return
+						}
+
+						if e.conn == nil {
+							return
+						}
+
+						reader = bufio.NewReader(e.conn)
 						continue
 					}
-
-					// Обновить reader после переподключения
-					reader = bufio.NewReader(e.conn)
-					continue
 				}
 
 				message, err := parseString(dataString)
 				if err != nil {
-					errCh <- fmt.Errorf("ошибка парснга: %w, строка: %s", err, dataString)
-					e.logger.Error("Ошибка парсинга",
-						"error", err,
-						"data", dataString)
+					select {
+					case <-ctx.Done():
+						return
+					case errCh <- fmt.Errorf("ошибка парсинга: %w, строка: %s", err, dataString):
+						e.logger.Error("Ошибка парсинга", "error", err, "data", dataString)
+					}
 					continue
 				}
 
-				message.Exchange = e.Name() // Добавляем имя биржи к сообщению
-				messageCh <- message
+				message.Exchange = e.Name()
+				select {
+				case <-ctx.Done():
+					return
+				case messageCh <- message:
+				}
 			}
 		}
 	}()
+
 	return messageCh, errCh
 }
 
-// IsConnected проверяет, установлено ли соединение
 func (e *TCPExchange) IsConnected() bool {
-	if e.conn != nil {
-		return true
-	} else {
-		return false
-	}
+	return e.conn != nil
 }
 
-// Name возвращает имя биржи
 func (e *TCPExchange) Name() string {
-
 	return e.exchange
 }
