@@ -121,12 +121,52 @@ func (e *TCPExchange) ReadPriceUpdates(ctx context.Context) (<-chan domain.Messa
 		reader := bufio.NewReader(e.conn)
 		e.logger.Info("Подключено к бирже, начинаем чтение данных", "exchange", e.Name())
 
+		// Добавляем экспоненциальную задержку для повторных подключений
+		initialDelay := 100 * time.Millisecond
+		maxDelay := 5 * time.Second
+		currentDelay := initialDelay
+
 		for {
 			select {
 			case <-ctx.Done():
 				e.logger.Info("Остановка чтения данных по запросу контекста", "exchange", e.Name())
 				return
 			default:
+				// Проверяем, что соединение существует
+				if e.conn == nil {
+					// Если соединение отсутствует, пытаемся переподключиться
+					err := fmt.Errorf("соединение отсутствует для биржи %s", e.Name())
+					select {
+					case <-ctx.Done():
+						return
+					case errCh <- err:
+						e.logger.Error("Ошибка соединения", "error", err, "exchange", e.Name())
+					}
+
+					// Используем экспоненциальную задержку перед повторным подключением
+					time.Sleep(currentDelay)
+					currentDelay = min(currentDelay*2, maxDelay)
+
+					if err := e.Connect(); err != nil {
+						select {
+						case <-ctx.Done():
+							return
+						case errCh <- fmt.Errorf("не удалось переподключиться: %w", err):
+							e.logger.Error("Ошибка переподключения", "error", err, "exchange", e.Name())
+						}
+						continue
+					}
+
+					if e.conn == nil {
+						continue
+					}
+
+					reader = bufio.NewReader(e.conn)
+					// Сбрасываем задержку после успешного подключения
+					currentDelay = initialDelay
+					continue
+				}
+
 				dataString, err := reader.ReadString('\n')
 				if err != nil {
 					select {
@@ -136,33 +176,34 @@ func (e *TCPExchange) ReadPriceUpdates(ctx context.Context) (<-chan domain.Messa
 						e.logger.Error("Ошибка чтения", "error", err, "exchange", e.Name())
 					}
 
-					e.conn.Close()
-					e.conn = nil
+					// Закрываем текущее соединение, если оно все еще установлено
+					if e.conn != nil {
+						e.conn.Close()
+						e.conn = nil
+					}
 
-					// После e.conn.Close() и e.conn = nil
-					// ПЕРЕД попыткой переподключения добавьте:
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						// Продолжаем с переподключением
+					// Используем экспоненциальную задержку перед повторным подключением
+					time.Sleep(currentDelay)
+					currentDelay = min(currentDelay*2, maxDelay)
 
-						if err := e.Connect(); err != nil {
-							select {
-							case <-ctx.Done():
-								return
-							case errCh <- fmt.Errorf("не удалось переподключиться: %w", err):
-							}
+					if err := e.Connect(); err != nil {
+						select {
+						case <-ctx.Done():
 							return
+						case errCh <- fmt.Errorf("не удалось переподключиться: %w", err):
+							e.logger.Error("Ошибка переподключения", "error", err, "exchange", e.Name())
 						}
-
-						if e.conn == nil {
-							return
-						}
-
-						reader = bufio.NewReader(e.conn)
 						continue
 					}
+
+					if e.conn == nil {
+						continue
+					}
+
+					reader = bufio.NewReader(e.conn)
+					// Сбрасываем задержку после успешного подключения
+					currentDelay = initialDelay
+					continue
 				}
 
 				message, err := parseString(dataString)
@@ -195,4 +236,12 @@ func (e *TCPExchange) IsConnected() bool {
 
 func (e *TCPExchange) Name() string {
 	return e.exchange
+}
+
+// Вспомогательная функция min для определения минимального значения из двух duration
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }

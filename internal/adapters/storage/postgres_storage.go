@@ -1,18 +1,30 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
 	"marketflow/internal/domain"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
 )
 
+// Константы для настройки батчинга
+const (
+	BatchSize       = 100 // Максимальное количество записей в одном батче
+	BatchTimeoutSec = 10  // Таймаут записи батча в секундах
+)
+
 type PostgresStorage struct {
-	db     *sql.DB
-	logger *slog.Logger
+	db              *sql.DB
+	logger          *slog.Logger
+	aggregateBuffer []domain.AggregatedData // Буфер для накопления агрегированных данных
+	bufferMutex     sync.Mutex              // Мьютекс для защиты буфера
+	batchingCtx     context.Context         // Контекст для управления горутиной батчинга
+	batchingCancel  context.CancelFunc      // Функция отмены контекста
 }
 
 func NewPostgresStorage(connectionString string, logger *slog.Logger) (*PostgresStorage, error) {
@@ -25,16 +37,28 @@ func NewPostgresStorage(connectionString string, logger *slog.Logger) (*Postgres
 		return nil, fmt.Errorf("failed to ping postgres: %w", err)
 	}
 
+	// Создаем контекст для управления горутиной батчинга
+	ctx, cancel := context.WithCancel(context.Background())
+
 	storage := &PostgresStorage{
-		db:     db,
-		logger: logger,
+		db:              db,
+		logger:          logger,
+		aggregateBuffer: make([]domain.AggregatedData, 0, BatchSize),
+		batchingCtx:     ctx,
+		batchingCancel:  cancel,
 	}
 
 	if err := storage.createTables(); err != nil {
+		cancel() // Отменяем контекст в случае ошибки
 		return nil, err
 	}
 
-	logger.Info("PostgreSQL storage initialized successfully")
+	// Запускаем горутину для периодической записи батчей
+	go storage.startBatchProcessor()
+
+	logger.Info("PostgreSQL storage initialized successfully with batching support",
+		"batch_size", BatchSize,
+		"batch_timeout", BatchTimeoutSec)
 	return storage, nil
 }
 
@@ -92,31 +116,108 @@ func (s *PostgresStorage) GetLatestPrice(symbol string) (domain.Message, error) 
 	return msg, nil
 }
 
-// SaveAggregatedData - сохраняет агрегированные данные
+// SaveAggregatedData - добавляет агрегированные данные в буфер для пакетной записи
 func (s *PostgresStorage) SaveAggregatedData(data domain.AggregatedData) error {
-	query := `
-        INSERT INTO price_aggregates 
-        (pair_name, exchange, timestamp, average_price, min_price, max_price)
-        VALUES ($1, $2, $3, $4, $5, $6)`
+	s.bufferMutex.Lock()
+	defer s.bufferMutex.Unlock()
 
-	_, err := s.db.Exec(query,
-		data.PairName,
-		data.Exchange,
-		data.Timestamp,
-		data.AveragePrice,
-		data.MinPrice,
-		data.MaxPrice,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to save aggregated data: %w", err)
+	// Добавляем данные в буфер
+	s.aggregateBuffer = append(s.aggregateBuffer, data)
+
+	// Если буфер достиг максимального размера, записываем его в БД
+	if len(s.aggregateBuffer) >= BatchSize {
+		return s.flushBufferLocked()
 	}
 
-	s.logger.Debug("Saved aggregated data",
-		"pair", data.PairName,
-		"exchange", data.Exchange,
-		"avg", data.AveragePrice)
+	return nil
+}
+
+// flushBufferLocked - записывает все данные из буфера в БД (должен вызываться с заблокированным мьютексом)
+func (s *PostgresStorage) flushBufferLocked() error {
+	if len(s.aggregateBuffer) == 0 {
+		return nil
+	}
+
+	// Начинаем транзакцию
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	// Prepare statement для пакетной вставки
+	stmt, err := tx.Prepare(`
+		INSERT INTO price_aggregates 
+		(pair_name, exchange, timestamp, average_price, min_price, max_price)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	// Выполняем вставку для каждой записи в буфере
+	for _, data := range s.aggregateBuffer {
+		_, err := stmt.Exec(
+			data.PairName,
+			data.Exchange,
+			data.Timestamp,
+			data.AveragePrice,
+			data.MinPrice,
+			data.MaxPrice,
+		)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to execute batch insert: %w", err)
+		}
+	}
+
+	// Коммитим транзакцию
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	s.logger.Info("Batch saved to database", "records", len(s.aggregateBuffer))
+
+	// Очищаем буфер
+	s.aggregateBuffer = make([]domain.AggregatedData, 0, BatchSize)
 
 	return nil
+}
+
+// FlushBuffer - публичный метод для принудительной записи данных из буфера
+func (s *PostgresStorage) FlushBuffer() error {
+	s.bufferMutex.Lock()
+	defer s.bufferMutex.Unlock()
+
+	return s.flushBufferLocked()
+}
+
+// startBatchProcessor - запускает горутину для периодической записи батчей
+func (s *PostgresStorage) startBatchProcessor() {
+	ticker := time.NewTicker(time.Duration(BatchTimeoutSec) * time.Second)
+	defer ticker.Stop()
+
+	s.logger.Info("Starting batch processor", "timeout_sec", BatchTimeoutSec)
+
+	for {
+		select {
+		case <-ticker.C:
+			// Периодически записываем данные из буфера, даже если он не заполнен
+			if err := s.FlushBuffer(); err != nil {
+				s.logger.Error("Failed to flush buffer", "error", err)
+			}
+		case <-s.batchingCtx.Done():
+			// Завершаем работу при отмене контекста
+			s.logger.Info("Batch processor shutting down")
+			// Записываем оставшиеся данные
+			if err := s.FlushBuffer(); err != nil {
+				s.logger.Error("Failed to flush buffer during shutdown", "error", err)
+			}
+			return
+		}
+	}
 }
 
 // GetAggregatedData - получает агрегированные данные за период
@@ -158,7 +259,16 @@ func (s *PostgresStorage) GetAggregatedData(symbol, exchange string, from, to ti
 	return results, nil
 }
 
-// Close - закрывает соединение с БД
+// Close - закрывает соединение с БД и выполняет необходимые действия при закрытии
 func (s *PostgresStorage) Close() error {
+	// Отменяем контекст для остановки горутины батчинга
+	s.batchingCancel()
+
+	// Записываем оставшиеся данные из буфера
+	if err := s.FlushBuffer(); err != nil {
+		s.logger.Error("Failed to flush buffer during closing", "error", err)
+	}
+
+	// Закрываем соединение с БД
 	return s.db.Close()
 }
