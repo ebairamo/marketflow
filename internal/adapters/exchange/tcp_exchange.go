@@ -9,14 +9,17 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type TCPExchange struct {
-	address  string
-	exchange string
-	conn     net.Conn
-	logger   *slog.Logger
+	address   string
+	exchange  string
+	conn      net.Conn
+	logger    *slog.Logger
+	mu        sync.RWMutex // Защита conn от конкурентного доступа
+	connected bool         // Флаг состояния подключения
 }
 
 func parseString(s string) (domain.Message, error) {
@@ -53,40 +56,76 @@ func parseString(s string) (domain.Message, error) {
 
 func NewTCPExchange(address, exchange string, logger *slog.Logger) *TCPExchange {
 	return &TCPExchange{
-		address:  address,
-		exchange: exchange,
-		logger:   logger,
+		address:   address,
+		exchange:  exchange,
+		logger:    logger,
+		connected: false,
 	}
 }
 
 func (e *TCPExchange) Connect() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Если уже подключены, закрываем старое соединение
+	if e.conn != nil {
+		e.conn.Close()
+		e.conn = nil
+		e.connected = false
+	}
+
 	e.logger.Info("Connecting to exchange",
-		"exchange", e.Name(),
+		"exchange", e.exchange,
 		"address", e.address)
 
-	conn, err := net.Dial("tcp", e.address)
+	// Устанавливаем таймаут на подключение
+	dialer := net.Dialer{
+		Timeout: 5 * time.Second,
+	}
+
+	conn, err := dialer.Dial("tcp", e.address)
 	if err != nil {
 		e.logger.Error("Failed to connect to exchange",
-			"exchange", e.Name(),
+			"exchange", e.exchange,
 			"address", e.address,
 			"error", err)
-		return fmt.Errorf("failed to connect to exchange %s: %w", e.Name(), err)
+		return fmt.Errorf("failed to connect to %s at %s: %w", e.exchange, e.address, err)
 	}
 
 	e.conn = conn
+	e.connected = true
+
 	e.logger.Info("Successfully connected to exchange",
-		"exchange", e.Name(),
+		"exchange", e.exchange,
 		"address", e.address)
+
 	return nil
 }
 
 func (e *TCPExchange) Close() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if e.conn != nil {
-		e.conn.Close()
-		e.logger.Info("Соединение закрыто", "exchange", e.Name())
+		err := e.conn.Close()
 		e.conn = nil
+		e.connected = false
+		e.logger.Info("Connection closed", "exchange", e.exchange)
+		return err
 	}
+
+	e.connected = false
 	return nil
+}
+
+func (e *TCPExchange) IsConnected() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.connected
+}
+
+func (e *TCPExchange) Name() string {
+	return e.exchange
 }
 
 func (e *TCPExchange) ReadPriceUpdates(ctx context.Context) (<-chan domain.Message, <-chan error) {
@@ -97,151 +136,114 @@ func (e *TCPExchange) ReadPriceUpdates(ctx context.Context) (<-chan domain.Messa
 		defer func() {
 			close(messageCh)
 			close(errCh)
+			e.logger.Info("ReadPriceUpdates goroutine finished", "exchange", e.exchange)
 		}()
-
-		if e.conn == nil {
-			err := fmt.Errorf("соединение не установлено для биржи %s", e.Name())
-			select {
-			case <-ctx.Done():
-				return
-			case errCh <- err:
-				e.logger.Error("Ошибка соединения", "error", err)
-			}
-
-			if err := e.Connect(); err != nil {
-				select {
-				case <-ctx.Done():
-					return
-				case errCh <- fmt.Errorf("не удалось подключиться: %w", err):
-				}
-				return
-			}
-		}
-
-		reader := bufio.NewReader(e.conn)
-		e.logger.Info("Подключено к бирже, начинаем чтение данных", "exchange", e.Name())
-
-		// Добавляем экспоненциальную задержку для повторных подключений
-		initialDelay := 100 * time.Millisecond
-		maxDelay := 5 * time.Second
-		currentDelay := initialDelay
 
 		for {
 			select {
 			case <-ctx.Done():
-				e.logger.Info("Остановка чтения данных по запросу контекста", "exchange", e.Name())
+				e.logger.Info("Context cancelled, stopping price updates reader", "exchange", e.exchange)
 				return
 			default:
-				// Проверяем, что соединение существует
-				if e.conn == nil {
-					// Если соединение отсутствует, пытаемся переподключиться
-					err := fmt.Errorf("соединение отсутствует для биржи %s", e.Name())
-					select {
-					case <-ctx.Done():
-						return
-					case errCh <- err:
-						e.logger.Error("Ошибка соединения", "error", err, "exchange", e.Name())
-					}
+			}
 
-					// Используем экспоненциальную задержку перед повторным подключением
-					time.Sleep(currentDelay)
-					currentDelay = min(currentDelay*2, maxDelay)
+			// Получаем текущее соединение
+			e.mu.RLock()
+			conn := e.conn
+			isConnected := e.connected
+			e.mu.RUnlock()
 
-					if err := e.Connect(); err != nil {
-						select {
-						case <-ctx.Done():
-							return
-						case errCh <- fmt.Errorf("не удалось переподключиться: %w", err):
-							e.logger.Error("Ошибка переподключения", "error", err, "exchange", e.Name())
-						}
-						continue
-					}
-
-					if e.conn == nil {
-						continue
-					}
-
-					reader = bufio.NewReader(e.conn)
-					// Сбрасываем задержку после успешного подключения
-					currentDelay = initialDelay
-					continue
-				}
-
-				dataString, err := reader.ReadString('\n')
-				if err != nil {
-					select {
-					case <-ctx.Done():
-						return
-					case errCh <- err:
-						e.logger.Error("Ошибка чтения", "error", err, "exchange", e.Name())
-					}
-
-					// Закрываем текущее соединение, если оно все еще установлено
-					if e.conn != nil {
-						e.conn.Close()
-						e.conn = nil
-					}
-
-					// Используем экспоненциальную задержку перед повторным подключением
-					time.Sleep(currentDelay)
-					currentDelay = min(currentDelay*2, maxDelay)
-
-					if err := e.Connect(); err != nil {
-						select {
-						case <-ctx.Done():
-							return
-						case errCh <- fmt.Errorf("не удалось переподключиться: %w", err):
-							e.logger.Error("Ошибка переподключения", "error", err, "exchange", e.Name())
-						}
-						continue
-					}
-
-					if e.conn == nil {
-						continue
-					}
-
-					reader = bufio.NewReader(e.conn)
-					// Сбрасываем задержку после успешного подключения
-					currentDelay = initialDelay
-					continue
-				}
-
-				message, err := parseString(dataString)
-				if err != nil {
-					select {
-					case <-ctx.Done():
-						return
-					case errCh <- fmt.Errorf("ошибка парсинга: %w, строка: %s", err, dataString):
-						e.logger.Error("Ошибка парсинга", "error", err, "data", dataString)
-					}
-					continue
-				}
-
-				message.Exchange = e.Name()
+			if !isConnected || conn == nil {
+				// Соединение не установлено
 				select {
+				case errCh <- fmt.Errorf("not connected to %s", e.exchange):
 				case <-ctx.Done():
 					return
-				case messageCh <- message:
+				default:
 				}
+
+				// Ждём немного перед следующей проверкой
+				select {
+				case <-time.After(100 * time.Millisecond):
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+
+			// Устанавливаем таймаут чтения
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+			// Создаём reader для текущего соединения
+			reader := bufio.NewReader(conn)
+
+			// Читаем данные
+			dataString, err := reader.ReadString('\n')
+			if err != nil {
+				// Проверяем, не был ли это таймаут
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// Таймаут - это нормально, продолжаем
+					continue
+				}
+
+				// Другая ошибка - отправляем и помечаем соединение как разорванное
+				e.logger.Error("Read error",
+					"exchange", e.exchange,
+					"error", err)
+
+				select {
+				case errCh <- fmt.Errorf("read error from %s: %w", e.exchange, err):
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// Помечаем соединение как разорванное
+				e.mu.Lock()
+				e.connected = false
+				if e.conn != nil {
+					e.conn.Close()
+					e.conn = nil
+				}
+				e.mu.Unlock()
+
+				// Ждём перед следующей попыткой
+				select {
+				case <-time.After(100 * time.Millisecond):
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+
+			// Парсим сообщение
+			message, err := parseString(dataString)
+			if err != nil {
+				e.logger.Error("Parse error",
+					"exchange", e.exchange,
+					"error", err,
+					"data", dataString)
+
+				select {
+				case errCh <- fmt.Errorf("parse error from %s: %w", e.exchange, err):
+				case <-ctx.Done():
+					return
+				default:
+				}
+				continue
+			}
+
+			// Добавляем имя биржи
+			message.Exchange = e.exchange
+
+			// Отправляем сообщение
+			select {
+			case messageCh <- message:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
 	return messageCh, errCh
-}
-
-func (e *TCPExchange) IsConnected() bool {
-	return e.conn != nil
-}
-
-func (e *TCPExchange) Name() string {
-	return e.exchange
-}
-
-// Вспомогательная функция min для определения минимального значения из двух duration
-func min(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

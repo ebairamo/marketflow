@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -79,7 +80,11 @@ func Run() {
 		log.Error("❌ Ошибка подключения к PostgreSQL", "error", err)
 		os.Exit(1)
 	}
-	defer postgresStorage.Close()
+	defer func() {
+		if err := postgresStorage.Close(); err != nil {
+			log.Error("Ошибка закрытия PostgreSQL", "error", err)
+		}
+	}()
 
 	// Подключаемся к Redis
 	log.Info("💾 Подключаемся к Redis...")
@@ -89,26 +94,77 @@ func Run() {
 		log.Error("❌ Ошибка подключения к Redis", "error", err)
 		os.Exit(1)
 	}
-	// После создания redisCache
+	// Устанавливаем fallback storage
 	redisCache.SetStorage(postgresStorage)
-	defer redisCache.Close()
+	defer func() {
+		if err := redisCache.Close(); err != nil {
+			log.Error("Ошибка закрытия Redis", "error", err)
+		}
+	}()
 
 	// Создаём биржи для Live режима
 	log.Info("🏛️ Инициализация настройки бирж...")
 	var liveExchanges []domain.ExchangePort
+	var liveExchangeNames []string
 	for _, exCfg := range cfg.Exchanges {
 		exchange := exchange.NewTCPExchange(exCfg.Address, exCfg.Name, log)
 		liveExchanges = append(liveExchanges, exchange)
+		liveExchangeNames = append(liveExchangeNames, exCfg.Name)
 	}
 
-	// Текущие активные биржи (по умолчанию - Live режим)
-	var currentExchanges []domain.ExchangePort = liveExchanges
+	// Имена тестовых бирж
+	testExchangeNames := []string{"TestExchange1", "TestExchange2", "TestExchange3"}
 
-	// Создаём сервис обработки рыночных данных
-	marketService := services.NewMarketService(currentExchanges, postgresStorage, redisCache, log)
+	// Переменные для управления режимами
+	var (
+		currentExchanges  []domain.ExchangePort
+		marketService     *services.MarketService
+		workerPool        *concurrency.WorkerPool
+		aggregationCancel context.CancelFunc
+		serviceCtx        context.Context
+		serviceCancel     context.CancelFunc
+		messageCh         <-chan domain.Message
+		errCh             <-chan error
+		mu                sync.Mutex // Защита при переключении режимов
+	)
 
-	// Настраиваем воркеры
-	workerPool := concurrency.NewWorkerPool(5, postgresStorage, redisCache, log)
+	// Функция для запуска сервисов
+	startServices := func(exchanges []domain.ExchangePort, exchangeNames []string, webHandler *web.Handler) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		// Останавливаем предыдущие сервисы если они есть
+		if serviceCancel != nil {
+			serviceCancel()
+			// Даём время на graceful shutdown
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		if aggregationCancel != nil {
+			aggregationCancel()
+		}
+
+		// Создаём новый контекст для сервисов
+		serviceCtx, serviceCancel = context.WithCancel(ctx)
+
+		// Обновляем список валидных бирж в handler
+		webHandler.UpdateValidExchanges(exchangeNames)
+
+		// Создаём сервис обработки рыночных данных
+		marketService = services.NewMarketService(exchanges, postgresStorage, redisCache, log)
+
+		// Запускаем обработку данных
+		messageCh, errCh = marketService.Start(serviceCtx)
+
+		// Создаём и запускаем Worker Pool
+		workerPool = concurrency.NewWorkerPool(5, postgresStorage, redisCache, log)
+		workerPool.Start(serviceCtx, messageCh)
+
+		// Запускаем периодическую агрегацию данных
+		var aggregationCtx context.Context
+		aggregationCtx, aggregationCancel = context.WithCancel(serviceCtx)
+		go startAggregationTask(aggregationCtx, redisCache, postgresStorage, log)
+	}
 
 	// Создаем и настраиваем HTTP-обработчики
 	webHandler := web.NewHandler(redisCache, postgresStorage, log)
@@ -122,15 +178,10 @@ func Run() {
 		}
 	}()
 
-	// Запускаем обработку данных
-	messageCh, errCh := marketService.Start(ctx)
-
-	// Запускаем Worker Pool
-	workerPool.Start(ctx, messageCh)
-
-	// Запускаем периодическую агрегацию данных (каждую минуту)
-	aggregationCtx, aggregationCancel := context.WithCancel(ctx)
-	go startAggregationTask(aggregationCtx, redisCache, postgresStorage, log)
+	// Запускаем начальные сервисы (Live режим по умолчанию)
+	log.Info("🔧 Запуск в Live режиме")
+	currentExchanges = liveExchanges
+	startServices(currentExchanges, liveExchangeNames, webHandler)
 
 	// Обработка сигналов завершения
 	signalCh := make(chan os.Signal, 1)
@@ -143,7 +194,9 @@ func Run() {
 
 	// Счётчики для статистики
 	messageCount := 0
+	errorCount := 0
 	startTime := time.Now()
+	lastStatTime := time.Now()
 
 	// Основной цикл обработки
 	for {
@@ -152,126 +205,159 @@ func Run() {
 		case mode := <-modeCh:
 			if mode {
 				log.Info("🔄 Переключение в Live режим")
-
-				// Останавливаем текущие процессы агрегации
-				aggregationCancel()
-
-				// Создаем новый контекст для обработки данных
-				newCtx, newCancel := context.WithCancel(context.Background())
-
-				// Отменяем текущий контекст, останавливая все горутины
-				cancel()
-
-				// Обновляем контекст и его отмену
-				ctx = newCtx
-				cancel = newCancel
-
-				// Используем Live биржи
 				currentExchanges = liveExchanges
-
-				// Создаем новый сервис с Live биржами
-				marketService = services.NewMarketService(currentExchanges, postgresStorage, redisCache, log)
-
-				// Запускаем обработку данных с новыми биржами
-				messageCh, errCh = marketService.Start(ctx)
-
-				// Запускаем новый Worker Pool
-				workerPool = concurrency.NewWorkerPool(5, postgresStorage, redisCache, log)
-				workerPool.Start(ctx, messageCh)
-
-				// Запускаем новую задачу агрегации
-				aggregationCtx, aggregationCancel = context.WithCancel(ctx)
-				go startAggregationTask(aggregationCtx, redisCache, postgresStorage, log)
+				startServices(currentExchanges, liveExchangeNames, webHandler)
 
 				// Сбрасываем счетчики статистики
 				messageCount = 0
+				errorCount = 0
 				startTime = time.Now()
 			} else {
 				log.Info("🔄 Переключение в Test режим")
 
-				// Останавливаем текущие процессы агрегации
-				aggregationCancel()
-
-				// Создаем новый контекст для обработки данных
-				newCtx, newCancel := context.WithCancel(context.Background())
-
-				// Отменяем текущий контекст, останавливая все горутины
-				cancel()
-
-				// Обновляем контекст и его отмену
-				ctx = newCtx
-				cancel = newCancel
-
 				// Создаем тестовые биржи
 				testExchanges := testdata.CreateTestExchanges(log)
 				currentExchanges = testExchanges
-
-				// Создаем новый сервис с тестовыми биржами
-				marketService = services.NewMarketService(currentExchanges, postgresStorage, redisCache, log)
-
-				// Запускаем обработку данных с тестовыми биржами
-				messageCh, errCh = marketService.Start(ctx)
-
-				// Запускаем новый Worker Pool
-				workerPool = concurrency.NewWorkerPool(5, postgresStorage, redisCache, log)
-				workerPool.Start(ctx, messageCh)
-
-				// Запускаем новую задачу агрегации
-				aggregationCtx, aggregationCancel = context.WithCancel(ctx)
-				go startAggregationTask(aggregationCtx, redisCache, postgresStorage, log)
+				startServices(currentExchanges, testExchangeNames, webHandler)
 
 				// Сбрасываем счетчики статистики
 				messageCount = 0
+				errorCount = 0
 				startTime = time.Now()
 			}
 
 		// Обработка сообщений
-		case msg, ok := <-messageCh:
+		case _, ok := <-messageCh:
 			if !ok {
-				log.Error("Канал сообщений закрыт неожиданно")
+				// Канал закрыт - это нормально при переключении режимов
 				continue
 			}
 
 			messageCount++
 
-			// Выводим каждое 100-е сообщение для экономии логов
-			if messageCount%100 == 0 {
+			// Выводим статистику каждые 10 секунд
+			if time.Since(lastStatTime) > 10*time.Second {
 				rate := float64(messageCount) / time.Since(startTime).Seconds()
 				log.Info("📈 Статистика обработки",
-					"total", messageCount,
+					"total_messages", messageCount,
+					"total_errors", errorCount,
 					"rate", fmt.Sprintf("%.2f msg/sec", rate),
-					"last_symbol", msg.Symbol,
-					"last_price", msg.Price)
+					"uptime", time.Since(startTime).Round(time.Second))
+				lastStatTime = time.Now()
 			}
 
 		// Обработка ошибок
 		case err, ok := <-errCh:
 			if !ok {
-				log.Error("Канал ошибок закрыт неожиданно")
+				// Канал закрыт - это нормально при переключении режимов
 				continue
 			}
-			log.Error("❌ Ошибка обработки", "error", err)
 
-		// Обработка сигналов завершения
-		case <-signalCh:
-			log.Info("🛑 Получен сигнал завершения, останавливаем систему...")
+			errorCount++
 
-			// Сначала останавливаем HTTP-сервер
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer shutdownCancel()
-
-			if err := httpServer.Shutdown(shutdownCtx); err != nil {
-				log.Error("Ошибка при остановке HTTP-сервера", "error", err)
+			// Логируем только каждую 10-ю ошибку чтобы не спамить
+			if errorCount%10 == 1 {
+				log.Error("❌ Ошибка обработки",
+					"error", err,
+					"total_errors", errorCount)
 			}
 
-			// Останавливаем агрегацию
-			aggregationCancel()
+		// Обработка сигналов завершения
+		case sig := <-signalCh:
+			log.Info("🛑 Получен сигнал завершения, начинаем graceful shutdown...",
+				"signal", sig)
 
-			// Затем останавливаем остальные компоненты
+			// Создаём контекст с таймаутом для shutdown
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer shutdownCancel()
+
+			// WaitGroup для отслеживания завершения всех компонентов
+			var shutdownWg sync.WaitGroup
+
+			// 1. Останавливаем HTTP-сервер
+			shutdownWg.Add(1)
+			go func() {
+				defer shutdownWg.Done()
+				log.Info("Останавливаем HTTP-сервер...")
+				if err := httpServer.Shutdown(shutdownCtx); err != nil {
+					log.Error("Ошибка при остановке HTTP-сервера", "error", err)
+				} else {
+					log.Info("HTTP-сервер остановлен")
+				}
+			}()
+
+			// 2. Останавливаем агрегацию
+			if aggregationCancel != nil {
+				log.Info("Останавливаем агрегацию данных...")
+				aggregationCancel()
+			}
+
+			// 3. Останавливаем сервисы
+			if serviceCancel != nil {
+				log.Info("Останавливаем сервисы обработки данных...")
+				serviceCancel()
+			}
+
+			// 4. Останавливаем MarketService
+			if marketService != nil {
+				shutdownWg.Add(1)
+				go func() {
+					defer shutdownWg.Done()
+					log.Info("Останавливаем market service...")
+					marketService.Stop()
+					log.Info("Market service остановлен")
+				}()
+			}
+
+			// 5. Ждём завершения Worker Pool
+			if workerPool != nil {
+				shutdownWg.Add(1)
+				go func() {
+					defer shutdownWg.Done()
+					log.Info("Ожидаем завершения worker pool...")
+					workerPool.Wait()
+					totalProcessed := workerPool.GetTotalProcessed()
+					log.Info("Worker pool завершён",
+						"total_processed", totalProcessed)
+				}()
+			}
+
+			// 6. Flush данных в PostgreSQL
+			shutdownWg.Add(1)
+			go func() {
+				defer shutdownWg.Done()
+				log.Info("Сохраняем оставшиеся данные в PostgreSQL...")
+				if err := postgresStorage.FlushBuffer(); err != nil {
+					log.Error("Ошибка при сохранении данных", "error", err)
+				} else {
+					log.Info("Данные успешно сохранены")
+				}
+			}()
+
+			// Ждём завершения всех операций или таймаута
+			done := make(chan struct{})
+			go func() {
+				shutdownWg.Wait()
+				close(done)
+			}()
+
+			select {
+			case <-done:
+				log.Info("✅ Все компоненты успешно остановлены")
+			case <-shutdownCtx.Done():
+				log.Warn("⚠️ Таймаут shutdown, принудительное завершение")
+			}
+
+			// Отменяем основной контекст
 			cancel()
 
-			// Даём время на graceful shutdown
-			time.Sleep(time.Second)
+			// Финальная статистика
+			uptime := time.Since(startTime)
+			log.Info("📊 Финальная статистика",
+				"total_messages", messageCount,
+				"total_errors", errorCount,
+				"uptime", uptime.Round(time.Second),
+				"avg_rate", fmt.Sprintf("%.2f msg/sec", float64(messageCount)/uptime.Seconds()))
 
 			log.Info("👋 MarketFlow остановлен. До свидания!")
 			return
@@ -305,11 +391,20 @@ func startAggregationTask(ctx context.Context, cache domain.CachePort, storage d
 			// Список всех поддерживаемых пар
 			symbols := []string{"BTCUSDT", "DOGEUSDT", "TONUSDT", "SOLUSDT", "ETHUSDT"}
 
+			aggregatedCount := 0
+			startTime := time.Now()
+
 			for _, symbol := range symbols {
 				// Получаем данные за последнюю минуту из Redis
 				messages, err := cache.GetPricesInRange(symbol, time.Minute)
 				if err != nil {
-					logger.Error("Ошибка получения данных для агрегации", "error", err, "symbol", symbol)
+					logger.Error("Ошибка получения данных для агрегации",
+						"error", err,
+						"symbol", symbol)
+					continue
+				}
+
+				if len(messages) == 0 {
 					continue
 				}
 
@@ -359,14 +454,22 @@ func startAggregationTask(ctx context.Context, cache domain.CachePort, storage d
 							"symbol", symbol,
 							"exchange", exchange)
 					} else {
-						logger.Info("Сохранены агрегированные данные",
+						aggregatedCount++
+						logger.Debug("Сохранены агрегированные данные",
 							"symbol", symbol,
 							"exchange", exchange,
-							"avg", avg,
-							"min", min,
-							"max", max)
+							"avg", fmt.Sprintf("%.2f", avg),
+							"min", fmt.Sprintf("%.2f", min),
+							"max", fmt.Sprintf("%.2f", max),
+							"samples", len(msgs))
 					}
 				}
+			}
+
+			if aggregatedCount > 0 {
+				logger.Info("Агрегация завершена",
+					"aggregated_records", aggregatedCount,
+					"duration", time.Since(startTime).Round(time.Millisecond))
 			}
 		}
 	}

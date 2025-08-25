@@ -136,13 +136,44 @@ func (c *RedisCache) CachePrice(message domain.Message) error {
 	// Ключ для последней цены: latest:BTCUSDT:Exchange1
 	key := fmt.Sprintf("latest:%s:%s", message.Symbol, message.Exchange)
 
+	// Также сохраняем общий ключ для символа со всех бирж
+	allKey := fmt.Sprintf("latest:%s:ALL", message.Symbol)
+
 	data, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
+	// Используем pipeline для атомарности операций
+	pipe := c.client.Pipeline()
+
 	// Храним с TTL 2 минуты (последняя минута + запас)
-	err = c.client.Set(c.ctx, key, data, 2*time.Minute).Err()
+	pipe.Set(c.ctx, key, data, 2*time.Minute)
+
+	// Обновляем общий ключ для символа (храним самую свежую цену)
+	pipe.ZAdd(c.ctx, allKey, redis.Z{
+		Score:  float64(message.Timestamp.UnixMilli()),
+		Member: data,
+	})
+
+	// Удаляем старые записи из общего ключа (оставляем только последние 10)
+	pipe.ZRemRangeByRank(c.ctx, allKey, 0, -11)
+
+	// Также добавляем в sorted set для истории последней минуты
+	historyKey := fmt.Sprintf("history:%s:%s", message.Symbol, message.Exchange)
+	score := float64(message.Timestamp.UnixMilli())
+
+	pipe.ZAdd(c.ctx, historyKey, redis.Z{
+		Score:  score,
+		Member: data,
+	})
+
+	// Удаляем старые записи (старше 1 минуты)
+	minScore := float64(time.Now().Add(-time.Minute).UnixMilli())
+	pipe.ZRemRangeByScore(c.ctx, historyKey, "0", fmt.Sprintf("%f", minScore))
+
+	// Выполняем все команды
+	_, err = pipe.Exec(c.ctx)
 	if err != nil {
 		// Если произошла ошибка Redis, обновляем статус и используем резервное хранилище
 		c.mutex.Lock()
@@ -157,27 +188,7 @@ func (c *RedisCache) CachePrice(message domain.Message) error {
 		return fmt.Errorf("redis operation failed and no fallback storage: %w", err)
 	}
 
-	// Также добавляем в sorted set для истории последней минуты
-	historyKey := fmt.Sprintf("history:%s:%s", message.Symbol, message.Exchange)
-	score := float64(message.Timestamp.UnixMilli())
-
-	err = c.client.ZAdd(c.ctx, historyKey, redis.Z{
-		Score:  score,
-		Member: data,
-	}).Err()
-	if err != nil {
-		c.logger.Error("Failed to add to history in Redis", "error", err)
-		return err
-	}
-
-	// Удаляем старые записи (старше 1 минуты)
-	minScore := float64(time.Now().Add(-time.Minute).UnixMilli())
-	err = c.client.ZRemRangeByScore(c.ctx, historyKey, "0", fmt.Sprintf("%f", minScore)).Err()
-	if err != nil {
-		c.logger.Error("Failed to remove old records from Redis", "error", err)
-	}
-
-	return err
+	return nil
 }
 
 // GetCachedPrice - получает последнюю цену для символа (с любой биржи)
@@ -193,6 +204,19 @@ func (c *RedisCache) GetCachedPrice(symbol string) (domain.Message, error) {
 		return domain.Message{}, fmt.Errorf("redis unavailable and no fallback storage")
 	}
 
+	// Сначала пробуем получить из общего ключа (самая свежая цена со всех бирж)
+	allKey := fmt.Sprintf("latest:%s:ALL", symbol)
+
+	// Получаем самую свежую запись (с наибольшим score)
+	results, err := c.client.ZRevRangeWithScores(c.ctx, allKey, 0, 0).Result()
+	if err == nil && len(results) > 0 {
+		var msg domain.Message
+		if err := json.Unmarshal([]byte(results[0].Member.(string)), &msg); err == nil {
+			return msg, nil
+		}
+	}
+
+	// Если не получилось из общего ключа, пробуем старый метод
 	pattern := fmt.Sprintf("latest:%s:*", symbol)
 	keys, err := c.client.Keys(c.ctx, pattern).Result()
 	if err != nil {
@@ -209,33 +233,44 @@ func (c *RedisCache) GetCachedPrice(symbol string) (domain.Message, error) {
 		return domain.Message{}, fmt.Errorf("redis operation failed and no fallback storage: %w", err)
 	}
 
-	if len(keys) == 0 {
+	// Фильтруем ключи, исключая ALL
+	var validKeys []string
+	for _, key := range keys {
+		if key != allKey {
+			validKeys = append(validKeys, key)
+		}
+	}
+
+	if len(validKeys) == 0 {
 		return domain.Message{}, fmt.Errorf("no cached price for symbol %s", symbol)
 	}
 
-	// Берём первый найденный ключ
-	data, err := c.client.Get(c.ctx, keys[0]).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return domain.Message{}, fmt.Errorf("no cached price for symbol %s", symbol)
+	// Получаем все цены и выбираем самую свежую
+	var latestMsg domain.Message
+	var latestTime time.Time
+
+	for _, key := range validKeys {
+		data, err := c.client.Get(c.ctx, key).Result()
+		if err != nil {
+			continue
 		}
 
-		// Если произошла ошибка Redis, обновляем статус и используем резервное хранилище
-		c.mutex.Lock()
-		c.redisAvailable = false
-		c.mutex.Unlock()
-
-		c.logger.Error("Failed to get data from Redis", "error", err)
-
-		if c.storage != nil {
-			return c.storage.GetLatestPrice(symbol)
+		var msg domain.Message
+		if err := json.Unmarshal([]byte(data), &msg); err != nil {
+			continue
 		}
-		return domain.Message{}, fmt.Errorf("redis operation failed and no fallback storage: %w", err)
+
+		if latestTime.IsZero() || msg.Timestamp.After(latestTime) {
+			latestMsg = msg
+			latestTime = msg.Timestamp
+		}
 	}
 
-	var msg domain.Message
-	err = json.Unmarshal([]byte(data), &msg)
-	return msg, err
+	if latestTime.IsZero() {
+		return domain.Message{}, fmt.Errorf("no cached price for symbol %s", symbol)
+	}
+
+	return latestMsg, nil
 }
 
 // GetCachedPriceByExchange - получает последнюю цену для символа с конкретной биржи

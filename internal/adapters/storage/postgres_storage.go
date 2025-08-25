@@ -25,35 +25,51 @@ type PostgresStorage struct {
 	bufferMutex     sync.Mutex              // Мьютекс для защиты буфера
 	batchingCtx     context.Context         // Контекст для управления горутиной батчинга
 	batchingCancel  context.CancelFunc      // Функция отмены контекста
+	shutdownCh      chan struct{}           // Канал для сигнала о завершении
+	wg              sync.WaitGroup          // Для ожидания завершения горутин
 }
 
 func NewPostgresStorage(connectionString string, logger *slog.Logger) (*PostgresStorage, error) {
+	// Настраиваем пул соединений
 	db, err := sql.Open("postgres", connectionString)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
 
-	if err := db.Ping(); err != nil {
+	// Настраиваем параметры пула
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	// Проверяем соединение
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to ping postgres: %w", err)
 	}
 
 	// Создаем контекст для управления горутиной батчинга
-	ctx, cancel := context.WithCancel(context.Background())
+	batchCtx, batchCancel := context.WithCancel(context.Background())
 
 	storage := &PostgresStorage{
 		db:              db,
 		logger:          logger,
 		aggregateBuffer: make([]domain.AggregatedData, 0, BatchSize),
-		batchingCtx:     ctx,
-		batchingCancel:  cancel,
+		batchingCtx:     batchCtx,
+		batchingCancel:  batchCancel,
+		shutdownCh:      make(chan struct{}),
 	}
 
 	if err := storage.createTables(); err != nil {
-		cancel() // Отменяем контекст в случае ошибки
+		batchCancel() // Отменяем контекст в случае ошибки
+		db.Close()
 		return nil, err
 	}
 
 	// Запускаем горутину для периодической записи батчей
+	storage.wg.Add(1)
 	go storage.startBatchProcessor()
 
 	logger.Info("PostgreSQL storage initialized successfully with batching support",
@@ -76,9 +92,15 @@ func (s *PostgresStorage) createTables() error {
     );
     
     CREATE INDEX IF NOT EXISTS idx_pair_exchange_time 
-    ON price_aggregates(pair_name, exchange, timestamp);`
+    ON price_aggregates(pair_name, exchange, timestamp);
+    
+    CREATE INDEX IF NOT EXISTS idx_timestamp 
+    ON price_aggregates(timestamp DESC);`
 
-	_, err := s.db.Exec(query)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := s.db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to create tables: %w", err)
 	}
@@ -104,7 +126,10 @@ func (s *PostgresStorage) GetLatestPrice(symbol string) (domain.Message, error) 
         ORDER BY timestamp DESC 
         LIMIT 1`
 
-	row := s.db.QueryRow(query, symbol)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	row := s.db.QueryRowContext(ctx, query, symbol)
 	err := row.Scan(&msg.Symbol, &msg.Exchange, &msg.Price, &msg.Timestamp)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -121,6 +146,14 @@ func (s *PostgresStorage) SaveAggregatedData(data domain.AggregatedData) error {
 	s.bufferMutex.Lock()
 	defer s.bufferMutex.Unlock()
 
+	// Проверяем, не идёт ли shutdown
+	select {
+	case <-s.shutdownCh:
+		// Во время shutdown записываем напрямую
+		return s.saveDirectly(data)
+	default:
+	}
+
 	// Добавляем данные в буфер
 	s.aggregateBuffer = append(s.aggregateBuffer, data)
 
@@ -132,56 +165,103 @@ func (s *PostgresStorage) SaveAggregatedData(data domain.AggregatedData) error {
 	return nil
 }
 
+// saveDirectly - сохраняет данные напрямую в БД (для критических случаев)
+func (s *PostgresStorage) saveDirectly(data domain.AggregatedData) error {
+	query := `
+		INSERT INTO price_aggregates 
+		(pair_name, exchange, timestamp, average_price, min_price, max_price)
+		VALUES ($1, $2, $3, $4, $5, $6)`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := s.db.ExecContext(ctx,
+		query,
+		data.PairName,
+		data.Exchange,
+		data.Timestamp,
+		data.AveragePrice,
+		data.MinPrice,
+		data.MaxPrice,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to save data directly: %w", err)
+	}
+
+	return nil
+}
+
 // flushBufferLocked - записывает все данные из буфера в БД (должен вызываться с заблокированным мьютексом)
 func (s *PostgresStorage) flushBufferLocked() error {
 	if len(s.aggregateBuffer) == 0 {
 		return nil
 	}
 
+	// Создаём копию буфера для записи
+	dataToSave := make([]domain.AggregatedData, len(s.aggregateBuffer))
+	copy(dataToSave, s.aggregateBuffer)
+
+	// Очищаем буфер сразу
+	s.aggregateBuffer = make([]domain.AggregatedData, 0, BatchSize)
+
+	// Разблокируем мьютекс на время записи в БД
+	s.bufferMutex.Unlock()
+	err := s.saveBatch(dataToSave)
+	s.bufferMutex.Lock()
+
+	if err != nil {
+		// При ошибке возвращаем данные в буфер
+		s.aggregateBuffer = append(dataToSave, s.aggregateBuffer...)
+		return err
+	}
+
+	s.logger.Info("Batch saved to database", "records", len(dataToSave))
+	return nil
+}
+
+// saveBatch - сохраняет батч данных в БД
+func (s *PostgresStorage) saveBatch(data []domain.AggregatedData) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Начинаем транзакцию
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
+	defer tx.Rollback() // Откатываем если не было commit
 
 	// Prepare statement для пакетной вставки
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO price_aggregates 
 		(pair_name, exchange, timestamp, average_price, min_price, max_price)
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`)
 	if err != nil {
-		tx.Rollback()
 		return fmt.Errorf("failed to prepare statement: %w", err)
 	}
 	defer stmt.Close()
 
-	// Выполняем вставку для каждой записи в буфере
-	for _, data := range s.aggregateBuffer {
-		_, err := stmt.Exec(
-			data.PairName,
-			data.Exchange,
-			data.Timestamp,
-			data.AveragePrice,
-			data.MinPrice,
-			data.MaxPrice,
+	// Выполняем вставку для каждой записи
+	for _, item := range data {
+		_, err := stmt.ExecContext(ctx,
+			item.PairName,
+			item.Exchange,
+			item.Timestamp,
+			item.AveragePrice,
+			item.MinPrice,
+			item.MaxPrice,
 		)
 		if err != nil {
-			tx.Rollback()
 			return fmt.Errorf("failed to execute batch insert: %w", err)
 		}
 	}
 
 	// Коммитим транзакцию
 	if err := tx.Commit(); err != nil {
-		tx.Rollback()
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
-
-	s.logger.Info("Batch saved to database", "records", len(s.aggregateBuffer))
-
-	// Очищаем буфер
-	s.aggregateBuffer = make([]domain.AggregatedData, 0, BatchSize)
 
 	return nil
 }
@@ -196,6 +276,8 @@ func (s *PostgresStorage) FlushBuffer() error {
 
 // startBatchProcessor - запускает горутину для периодической записи батчей
 func (s *PostgresStorage) startBatchProcessor() {
+	defer s.wg.Done()
+
 	ticker := time.NewTicker(time.Duration(BatchTimeoutSec) * time.Second)
 	defer ticker.Stop()
 
@@ -204,17 +286,32 @@ func (s *PostgresStorage) startBatchProcessor() {
 	for {
 		select {
 		case <-ticker.C:
-			// Периодически записываем данные из буфера, даже если он не заполнен
+			// Периодически записываем данные из буфера
 			if err := s.FlushBuffer(); err != nil {
 				s.logger.Error("Failed to flush buffer", "error", err)
 			}
+
 		case <-s.batchingCtx.Done():
 			// Завершаем работу при отмене контекста
 			s.logger.Info("Batch processor shutting down")
-			// Записываем оставшиеся данные
-			if err := s.FlushBuffer(); err != nil {
-				s.logger.Error("Failed to flush buffer during shutdown", "error", err)
+
+			// Финальная запись всех оставшихся данных
+			retries := 3
+			for i := 0; i < retries; i++ {
+				if err := s.FlushBuffer(); err != nil {
+					s.logger.Error("Failed to flush buffer during shutdown",
+						"error", err,
+						"attempt", i+1,
+						"max_attempts", retries)
+
+					if i < retries-1 {
+						time.Sleep(time.Second)
+						continue
+					}
+				}
+				break
 			}
+
 			return
 		}
 	}
@@ -229,9 +326,13 @@ func (s *PostgresStorage) GetAggregatedData(symbol, exchange string, from, to ti
         AND ($2 = '' OR exchange = $2)
         AND timestamp >= $3 
         AND timestamp <= $4
-        ORDER BY timestamp DESC`
+        ORDER BY timestamp DESC
+        LIMIT 1000`
 
-	rows, err := s.db.Query(query, symbol, exchange, from, to)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, query, symbol, exchange, from, to)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query aggregated data: %w", err)
 	}
@@ -256,19 +357,37 @@ func (s *PostgresStorage) GetAggregatedData(symbol, exchange string, from, to ti
 		results = append(results, data)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
 	return results, nil
 }
 
 // Close - закрывает соединение с БД и выполняет необходимые действия при закрытии
 func (s *PostgresStorage) Close() error {
+	s.logger.Info("Closing PostgreSQL storage")
+
+	// Сигнализируем о начале shutdown
+	close(s.shutdownCh)
+
 	// Отменяем контекст для остановки горутины батчинга
 	s.batchingCancel()
 
-	// Записываем оставшиеся данные из буфера
+	// Ждём завершения горутины батчинга
+	s.wg.Wait()
+
+	// Финальная попытка записать оставшиеся данные
 	if err := s.FlushBuffer(); err != nil {
 		s.logger.Error("Failed to flush buffer during closing", "error", err)
 	}
 
 	// Закрываем соединение с БД
-	return s.db.Close()
+	if err := s.db.Close(); err != nil {
+		s.logger.Error("Failed to close database connection", "error", err)
+		return err
+	}
+
+	s.logger.Info("PostgreSQL storage closed successfully")
+	return nil
 }
