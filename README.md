@@ -1,331 +1,595 @@
-# marketflow
+# MarketFlow
 
-## Learning Objectives
+Система обработки рыночных данных в реальном времени для криптовалютных бирж. Проект демонстрирует конкурентную обработку потоковых данных, кеширование и REST API на Go.
 
-- Concurrency and Parallelism
-- Concurrency Patterns
-- Real-time Data Processing
-- Data Caching (Redis)
+## 🚀 Возможности
 
-## Abstract
+- **Обработка в реальном времени**: получение и обработка данных о ценах с нескольких источников
+- **Два режима работы**:
+  - **Live Mode**: получение реальных данных с криптобирж
+  - **Test Mode**: генерация синтетических данных для тестирования
+- **Конкурентная обработка**: использование паттернов Fan-in, Fan-out, Worker Pool
+- **Кеширование в Redis**: быстрый доступ к последним ценам
+- **Хранение в PostgreSQL**: агрегированные данные с минутными интервалами
+- **REST API**: запросы цен, статистики и управление режимами
+- **Graceful Shutdown**: корректное завершение работы с очисткой ресурсов
 
-In this project, you will build a **Real-Time Market Data Processing System**. This system will be able to process a large volume of incoming data concurrently and efficiently.
+## 🛠️ Технологии
 
-Financial markets, especially cryptocurrency exchanges, generate vast amounts of data. Traders rely on real-time data to make decisions. This project will simulate the backend of a system that processes real-time cryptocurrency price updates from multiple sources. However, to ensure the system remains functional without external dependencies, the project will also support a test mode where prices are generated locally.
+- **Язык**: Go
+- **База данных**: PostgreSQL
+- **Кеш**: Redis
+- **Архитектура**: Hexagonal Architecture (Ports & Adapters)
+- **Конкурентность**: Channels, Goroutines, Worker Pools
+- **Логирование**: log/slog
 
-This project will give you hands-on experience in **real-time data ingestion, processing, caching, and storage** while ensuring data consistency and performance using **Go's concurrency primitives**.
+## 📦 Установка
 
-## Context
+```bash
+# Клонировать репозиторий
+git clone https://github.com/ebairamo/marketflow.git
+cd marketflow
 
-Imagine you're developing a system for a financial firm that requires real-time price updates from multiple cryptocurrency exchanges. The system must efficiently handle concurrent data streams, process updates in real time, and expose an API for querying recent prices and market statistics.  
-This project is real (a similar project is used at the workplace of one of the graduates). It integrates into a more complex system and addresses some business challenges.  
-To achieve this, the project will implement:
-
-Imagine you're developing a system for a financial firm that requires real-time price updates from multiple cryptocurrency exchanges. The system must efficiently handle concurrent data streams, process updates in real time, and expose an API for querying recent prices and market statistics.
-
-- Real-time data fetching (`Live Mode`)
-- Real-time test data fetching (`Test Mode`)
-- Concurrent data processing using channels & worker pools
-- Data storage in PostgreSQL
-- Redis caching for quick access to frequently requested prices
-- REST API for querying aggregated price data
-
-This project mirrors real-world applications used in trading platforms, giving you practical experience with Go’s concurrency model and backend architecture.
-
-## Resources
-
-- Read about Redis [here](https://redis.io/docs/latest/).
-- Read about concurrency [here](https://go.dev/doc/effective_go#concurrency), [here](https://go.dev/blog/pipelines), [here](https://dev.to/dwarvesf/approaches-to-manage-concurrent-workloads-like-worker-pools-and-pipelines-52ed) and [here](https://go.dev/talks/2012/concurrency.slide#1).
-
-## General Criteria
-
-- Your code MUST be written in accordance with [gofumpt](https://github.com/mvdan/gofumpt). If not, you will be graded `0` automatically.
-- Your program MUST be able to compile successfully.
-- Your program MUST not exit unexpectedly (any panics: `nil-pointer dereference`, `index out of range` etc.). If so, you will get `0` during the defence.
-- External packages are allowed only for working with the database and cache. If you use any other external packages, you will receive a grade of `0`.
-- The project MUST be compiled by the following command in the project's root directory:
-
-```sh
-$ go build -o marketflow .
+# Собрать проект
+go build -o marketflow .
 ```
 
-- If an error occurs during startup (e.g., invalid command-line arguments, failure to bind to a port), the program must exit with a non-zero status code and display a clear, understandable error message.
-  During normal operation, the server must handle errors gracefully, returning appropriate HTTP status codes to the client without crashing.
----
+### Зависимости
 
-## Mandatory Part
+```bash
+# PostgreSQL
+docker run --name postgres -e POSTGRES_PASSWORD=password -p 5432:5432 -d postgres
 
-### Baseline
-
-You will create a `marketflow` application, a system designed to process market data in real-time and offer a RESTful API for accessing price updates and more. The application should follow a hexagonal architecture. The project should emphasize clean code, maintainability, and scalability to ensure a robust and efficient solution.
-
-#### Outcomes:
-
-- Use a hexagonal architecture:
-
-  - Domain Layer: Defines core business logic and models.
-
-  - Application Layer: Implements use cases and orchestrates interactions between components.
-
-  - Adapters (Ports & Adapters Layer):
-
-    - Web Adapter (HTTP handlers) for REST API.
-
-    - Storage Adapter (PostgreSQL) for data persistence.
-
-    - Cache Adapter (Redis) for caching.
-
-    - Exchange Adapter for fetching live market data.
-
-- Support two data modes:
-
-  - Live Mode: Fetch real-time prices from three cryptocurrency exchanges.
-
-  - Test Mode: Generate synthetic market data locally.
-
-- Store market data in PostgreSQL.
-
-- Implement Redis caching for latest prices.
-
-- Implement concurrency patterns to efficiently process multiple price updates.
-
-  - Provide REST API endpoints for retrieving price information and statistics.
-  
-- An additional application provided by you for Test Mode should be able to generate data. 
-
-#### Where to get data from?
-
-You will be provided with a programs that simulates the behavior of cryptocurrency exchanges.  
-Run the `provided programs` and receive information on ports `40101`, `40102`, `40103`.  
-[exchange1_amd64](exchange1_amd64.tar)  
-[exchange1_arm64](exchange1_arm64.tar)  
-[exchange2_amd64](exchange2_amd64.tar)  
-[exchange2_arm64](exchange2_arm64.tar)   
-[exchange3_amd64](exchange3_amd64.tar)  
-[exchange3_arm64](exchange3_arm64.tar)
-
-##### How to run the provided programs?
-
-1. Define the CPU architecture.
-2. Then load the images:
-
-- `docker load -i exchange1_amd64.tar` or `docker load -i exchange1_arm64.tar`
-
-- `docker load -i exchange2_amd64.tar` or `docker load -i exchange2_arm64.tar`
-
-- `docker load -i exchange3_amd64.tar` or `docker load -i exchange3_arm64.tar`
-
-3. Run the images (example):
-- `docker run -p 40101:40101 --name exchange1-arm64 -d exchange3-arm64`
-- `docker run -p 40102:40102 --name exchange2-arm64 -d exchange2-arm64`
-- `docker run -p 40103:40103 --name exchange3-arm64 -d exchange3-arm64`
-
-Try to run ```nc 127.0.0.1 <port>``` after starting the provided programs.
-
-**It is necessary to receive data about pairs of the following types:**
-- `BTCUSDT`
-- `DOGEUSDT`
-- `TONUSDT`
-- `SOLUSDT`
-- `ETHUSDT`
-
-You need to implement your own test data generator for Test Mode.
-
-#### Additional conditions for live data handling
-
-- **Failover:** If connection fails, the system should automatically attempt to reconnect (Note: Stop and restart the provided program and/or the generator you implemented. 😉).
-
-### Concurrency Implementation and Patterns:
-
-This project heavily relies on concurrency to handle large volumes of real-time data. Key concurrency patterns that should be used include:
-
-- **Fan-in:** Aggregating multiple market data streams into a single channel for centralized processing.
-
-- **Fan-out:** Distributing incoming data updates to multiple workers to process them in parallel.
-
-- **[Worker Pool](https://gobyexample.com/worker-pools):** Managing a set of workers that process live updates efficiently, ensuring balanced workload distribution.
-
-- **Generator:** Implementing a generator to produce synthetic market data for `Test Mode`.
-
-Example:
+# Redis
+docker run --name redis -p 6379:6379 -d redis
 ```
 
-                      +---------------+       +---------------+       +---------------+
-                      |  Source 1     |       |  Source 2     |       |  Source 3     |
-                      |  (Generator)  |       |  (Generator)  |       |  (Generator)  |
-                      +-------+-------+       +-------+-------+       +-------+-------+
-                              |                       |                       |
-                              v                       v                       v
-                      +-------+-------+       +-------+-------+       +-------+-------+
-                      |   Fan-Out 1   |       |   Fan-Out 2   |       |   Fan-Out 3   |
-                      |  (Distributor)|       |  (Distributor)|       |  (Distributor)|
-                      +---+---+---+---+       +---+---+---+---+       +---+---+---+---+
-                          |   |   |               |   |   |               |   |   |
-          +---------------+-+-+-+-+-+-------------+-+-+-+-+-+---------------------------+
-          |               | | | | | |                 | | | | | |                       |
-          v               v v v v v v                 v v v v v v                       v
-      +---+---+       +---+---+---+---+-----+       +---+---+---+---+---+---+       +---+---+
-      |Worker1|       |Worker2| ... |WorkerN|       |WorkerN+1| ... |WorkerM|      |WorkerM+1|
-      +---+---+       +---+---+---+---+-----+       +---+---+---+---+---+---+       +---+---+
-          |               |                   ...       |                   ...         |
-          +---------------+-----------------------------+-------------------------------+
-                              | (all output channels)
-                              v
-                      +-------+-------+
-                      |    Fan-In     |
-                      |  (Aggregator) |
-                      +-------+-------+
-                              | (resultCh)
-                              v
-                      +-------+-------+
-                      |   Receiver    |
-                      | (Collector)   |
-                      +---------------+
+## 🎯 Использование
 
+### Запуск сервера
+
+```bash
+# Базовый запуск
+./marketflow --port 8080
+
+# Справка
+./marketflow --help
 ```
 
-- Listeners must send updates to a shared channel.
-- The Worker Pool should efficiently process multiple concurrent updates per exchange, allocating five workers to each data source.
-- Data must be batched (instead of per-update writes) before inserting into PostgreSQL.
-- If Redis is down, PostgreSQL should still receive data (fallback mechanism).
+### Конфигурация
 
-By implementing these patterns, the system will ensure efficient data ingestion, processing, and storage, leveraging Go’s built-in concurrency primitives.
+Создайте файл `config.yaml`:
 
-#### Test Mode
+```yaml
+postgres:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: password
+  database: marketflow
 
-You need to create a program that simulates the behavior of the provided programs for `Test Mode`.
-Implement the Generator pattern to provide synthetic data.
+redis:
+  host: localhost
+  port: 6379
+  password: ""
 
-### Data Storage and Caching
+exchanges:
+  - host: localhost
+    port: 40101
+  - host: localhost
+    port: 40102
+  - host: localhost
+    port: 40103
+```
 
-#### Real-Time Data Processing:
+## 🔄 Режимы работы
 
-- Use **Redis** to cache recent price data.
-- Keep the latest price for all price updates for at least the last minute for each trading pair from all exchanges.
-- Every minute, calculate the average price for each pair based on the last 60 seconds of data, store the result in PostgreSQL, and also save the minimum and maximum price values.
+### Live Mode
 
-You will need to decide which key and which value to save in Redis and how best to implement it.
+Получение реальных данных с криптобирж через предоставленные эмуляторы:
 
-Do not forget to delete irrelevant data.
+```bash
+# Переключить на Live Mode
+curl -X POST http://localhost:8080/mode/live
+```
 
-#### Data Storage
+**Поддерживаемые пары:**
+- BTCUSDT
+- ETHUSDT
+- SOLUSDT
+- DOGEUSDT
+- TONUSDT
 
-- Use **PostgreSQL** to store aggregated data.
-- Store data in a single table with the following fields:
-  - `pair_name` (string) – the trading pair name.
-  - `exchange` (string) – the exchange from which the data was received.
-  - `timestamp` (timestamp) – the time when the data is stored.
-  - `average_price` (float) – the average price of the trading pair over the last minute.
-  - `min_price` (float) – the minimum price of the trading pair over the last minute.
-  - `max_price` (float) – the maximum price of the trading pair over the last minute.
+### Test Mode
 
-### API Endpoints
+Генерация синтетических данных для тестирования:
 
-**Market Data API**
+```bash
+# Переключить на Test Mode
+curl -X POST http://localhost:8080/mode/test
+```
 
-`GET /prices/latest/{symbol}` – Get the latest price for a given symbol.
+## 📊 API Endpoints
 
-`GET /prices/latest/{exchange}/{symbol}` – Get the latest price for a given symbol from a specific exchange.
+### Получение цен
 
-`GET /prices/highest/{symbol}` – Get the highest price over a period.
+**Последняя цена**
+```bash
+# Со всех бирж
+curl http://localhost:8080/prices/latest/BTCUSDT
 
-`GET /prices/highest/{exchange}/{symbol}` – Get the highest price over a period from a specific exchange.
+# С конкретной биржи
+curl http://localhost:8080/prices/latest/exchange1/BTCUSDT
+```
 
-`GET /prices/highest/{symbol}?period={duration}` – Get the highest price within the last `{duration}` (e.g., the last `1s`,  `3s`, `5s`, `10s`, `30s`, `1m`, `3m`, `5m`).
+**Максимальная цена**
+```bash
+# За весь период
+curl http://localhost:8080/prices/highest/BTCUSDT
 
-`GET /prices/highest/{exchange}/{symbol}?period={duration}` – Get the highest price within the last `{duration}` from a specific exchange.
+# За последние 5 минут
+curl http://localhost:8080/prices/highest/BTCUSDT?period=5m
 
-`GET /prices/lowest/{symbol}` – Get the lowest price over a period.
+# С конкретной биржи за 30 секунд
+curl http://localhost:8080/prices/highest/exchange1/BTCUSDT?period=30s
+```
 
-`GET /prices/lowest/{exchange}/{symbol}` – Get the lowest price over a period from a specific exchange.
+**Минимальная цена**
+```bash
+# За весь период
+curl http://localhost:8080/prices/lowest/ETHUSDT
 
-`GET /prices/lowest/{symbol}?period={duration}` – Get the lowest price within the last {duration}.
+# За последнюю минуту
+curl http://localhost:8080/prices/lowest/ETHUSDT?period=1m
+```
 
-`GET /prices/lowest/{exchange}/{symbol}?period={duration}` – Get the lowest price within the last `{duration}` from a specific exchange.
+**Средняя цена**
+```bash
+# За весь период
+curl http://localhost:8080/prices/average/SOLUSDT
 
-`GET /prices/average/{symbol}` – Get the average price over a period.
+# За последние 3 минуты с конкретной биржи
+curl http://localhost:8080/prices/average/exchange2/SOLUSDT?period=3m
+```
 
-`GET /prices/average/{exchange}/{symbol}` – Get the average price over a period from a specific exchange.
+### Системные endpoints
 
-`GET /prices/average/{exchange}/{symbol}?period={duration}` – Get the average price within the last `{duration}` from a specific exchange
+**Проверка здоровья системы**
+```bash
+curl http://localhost:8080/health
+```
 
-**Data Mode API**
+**Переключение режима**
+```bash
+# Test Mode
+curl -X POST http://localhost:8080/mode/test
 
-`POST /mode/test` – Switch to `Test Mode` (use generated data).
+# Live Mode
+curl -X POST http://localhost:8080/mode/live
+```
 
-`POST /mode/live` – Switch to `Live Mode` (fetch data from `provided programs`).
+## 🏗️ Архитектура
 
-**System Health**
+### Hexagonal Architecture
 
-`GET /health` - Returns system status (e.g., connections, Redis availability).  
+```
+┌─────────────────────────────────────────┐
+│           HTTP Handlers (API)           │
+│          (Web Adapter)                  │
+└─────────────┬───────────────────────────┘
+              │
+┌─────────────▼───────────────────────────┐
+│      Application Layer (Use Cases)      │
+│  - Price Processing                     │
+│  - Data Aggregation                     │
+│  - Mode Switching                       │
+└─────────────┬───────────────────────────┘
+              │
+┌─────────────▼───────────────────────────┐
+│         Domain Layer (Models)           │
+│  - Price, Exchange, Pair                │
+└─────────────┬───────────────────────────┘
+              │
+    ┌─────────┴─────────┐
+    │                   │
+┌───▼──────┐      ┌─────▼────────┐
+│PostgreSQL│      │    Redis     │
+│ Adapter  │      │   Adapter    │
+└──────────┘      └──────────────┘
+```
 
-**You need to come up with the responses yourself.**
+### Паттерны конкурентности
+
+**Fan-Out Pattern**
+- Распределение данных от одного источника между несколькими воркерами
+
+**Fan-In Pattern**
+- Объединение данных от нескольких источников в один канал
+
+**Worker Pool**
+- Пул из 5 воркеров на каждую биржу для обработки данных
+
+**Generator**
+- Генератор синтетических данных для Test Mode
+
+## 💾 Хранение данных
+
+### Redis (Кеш)
+
+Хранение последних цен за последнюю минуту для каждой пары с каждой биржи.
+
+**Структура ключей:**
+```
+price:{exchange}:{pair}:{timestamp}
+```
+
+### PostgreSQL (База данных)
+
+Агрегированные данные за каждую минуту.
+
+**Таблица: market_data**
+```sql
+CREATE TABLE market_data (
+    id SERIAL PRIMARY KEY,
+    pair_name VARCHAR(20) NOT NULL,
+    exchange VARCHAR(50) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    average_price DECIMAL(20, 8) NOT NULL,
+    min_price DECIMAL(20, 8) NOT NULL,
+    max_price DECIMAL(20, 8) NOT NULL
+);
+```
+
+## 📝 Примеры использования
+
+```bash
+# Запуск в Live Mode
+./marketflow --port 8080
+
+# Проверка здоровья
+curl http://localhost:8080/health
+
+# Получить последнюю цену BTC
+curl http://localhost:8080/prices/latest/BTCUSDT
+
+# Получить максимальную цену ETH за последние 5 минут
+curl http://localhost:8080/prices/highest/ETHUSDT?period=5m
+
+# Переключиться на Test Mode
+curl -X POST http://localhost:8080/mode/test
+
+# Получить среднюю цену SOL с биржи exchange1
+curl http://localhost:8080/prices/average/exchange1/SOLUSDT
+```
+
+## 🔧 Обработка ошибок
+
+- **Автоматическое переподключение** при потере связи с биржей
+- **Fallback механизм**: если Redis недоступен, данные сохраняются в PostgreSQL
+- **Graceful degradation**: система продолжает работу при частичных сбоях
+- **Батчинг записей**: группировка операций для оптимизации производительности
+
+## 🎓 Цели обучения
+
+Этот проект демонстрирует:
+- Конкурентное программирование в Go
+- Паттерны конкурентности (Fan-in, Fan-out, Worker Pool, Generator)
+- Обработку потоковых данных в реальном времени
+- Работу с Redis для кеширования
+- Работу с PostgreSQL для хранения данных
+- Hexagonal Architecture
+- REST API дизайн
+- Graceful Shutdown
+
+## 📚 Ссылки
+
+- [Go Concurrency Patterns](https://go.dev/blog/pipelines)
+- [Redis Documentation](https://redis.io/docs/)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
+- [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)
+
+## 🙏 Автор задания
+
+**Savva Savostyanov**
+- Email: savvax@savvax.com
+- [GitHub](https://github.com/savvax)
+- [LinkedIn](https://www.linkedin.com/in/savvax/)
+
+# MarketFlow
+
+Real-time market data processing system for cryptocurrency exchanges. This project demonstrates concurrent stream processing, caching, and REST API design in Go.
+
+## 🚀 Features
+
+- **Real-time Processing**: receive and process price data from multiple sources
+- **Dual Operation Modes**:
+  - **Live Mode**: fetch real data from crypto exchanges
+  - **Test Mode**: generate synthetic data for testing
+- **Concurrent Processing**: implements Fan-in, Fan-out, Worker Pool patterns
+- **Redis Caching**: fast access to latest prices
+- **PostgreSQL Storage**: aggregated data with minute-level intervals
+- **REST API**: query prices, statistics, and manage operation modes
+- **Graceful Shutdown**: proper cleanup and resource management
+
+## 🛠️ Tech Stack
+
+- **Language**: Go
+- **Database**: PostgreSQL
+- **Cache**: Redis
+- **Architecture**: Hexagonal Architecture (Ports & Adapters)
+- **Concurrency**: Channels, Goroutines, Worker Pools
+- **Logging**: log/slog
+
+## 📦 Installation
+
+```bash
+# Clone repository
+git clone https://github.com/ebairamo/marketflow.git
+cd marketflow
+
+# Build project
+go build -o marketflow .
+```
+
+### Dependencies
+
+```bash
+# PostgreSQL
+docker run --name postgres -e POSTGRES_PASSWORD=password -p 5432:5432 -d postgres
+
+# Redis
+docker run --name redis -p 6379:6379 -d redis
+```
+
+## 🎯 Usage
+
+### Starting the Server
+
+```bash
+# Basic usage
+./marketflow --port 8080
+
+# Help
+./marketflow --help
+```
 
 ### Configuration
 
-The application should read configuration from a file. The configuration should include the following parameters:
-- PostgreSQL connection details (host, port, user, password, database and etc.).
-- Redis connection details (host, port, password and etc.).
-- Connection details (host, port, etc.) for the provided exchange emulations and your test implementation.
+Create `config.yaml` file:
 
-### Logging
+```yaml
+postgres:
+  host: localhost
+  port: 5432
+  user: postgres
+  password: password
+  database: marketflow
 
-- Use Go's log/slog package for logging throughout the application.
-- Log significant events, errors information with appropriate levels (`Info`, `Warning`, `Error`).
-- Include contextual information in logs (e.g., timestamps, IDs).
+redis:
+  host: localhost
+  port: 6379
+  password: ""
 
-### Shutdown
-
-Implement graceful shutdown handling to ensure the application cleans up resources and exits cleanly when receiving a termination signal (e.g., `SIGINT`, `SIGTERM`).
-
-### Usage
-
-Your program must be able to print usage information.
-
-Outcomes:
-- Program prints usage text.
-
-```sh
-$ ./marketflow --help
-
-Usage:
-  marketflow [--port <N>]
-  marketflow --help
-
-Options:
-  --port N     Port number
+exchanges:
+  - host: localhost
+    port: 40101
+  - host: localhost
+    port: 40102
+  - host: localhost
+    port: 40103
 ```
 
----
+## 🔄 Operation Modes
 
-## Support
+### Live Mode
 
-Believe in yourself and you will succeed.
+Fetch real data from cryptocurrency exchanges via provided emulators:
 
----
-## Guidelines from Author
+```bash
+# Switch to Live Mode
+curl -X POST http://localhost:8080/mode/live
+```
 
-First of all, implement data acquisition from at least one source.  
-Study the patterns and think about how to apply them.  
-Then implement the caching of data in Redis.  
-Then implement the storage of data in PostgreSQL.  
-Then partially implement the API.
-Then implement the rest of the sources.  
-Then implement the rest of the patterns.  
-Then implement the rest of the API.  
-Then implement the rest of the features.
+**Supported pairs:**
+- BTCUSDT
+- ETHUSDT
+- SOLUSDT
+- DOGEUSDT
+- TONUSDT
 
-Good luck, Buddy 😊
+### Test Mode
 
----
-## Author
+Generate synthetic data for testing:
 
-This project has been created by:
+```bash
+# Switch to Test Mode
+curl -X POST http://localhost:8080/mode/test
+```
 
-Savva Savostyanov
+## 📊 API Endpoints
 
-Contacts:
+### Price Queries
 
-- Email: [savvax@savvax.com](mailto:savvax@savvax.com)
-- [GitHub](https://github.com/savvax/)
+**Latest Price**
+```bash
+# From all exchanges
+curl http://localhost:8080/prices/latest/BTCUSDT
+
+# From specific exchange
+curl http://localhost:8080/prices/latest/exchange1/BTCUSDT
+```
+
+**Highest Price**
+```bash
+# All time
+curl http://localhost:8080/prices/highest/BTCUSDT
+
+# Last 5 minutes
+curl http://localhost:8080/prices/highest/BTCUSDT?period=5m
+
+# From specific exchange, last 30 seconds
+curl http://localhost:8080/prices/highest/exchange1/BTCUSDT?period=30s
+```
+
+**Lowest Price**
+```bash
+# All time
+curl http://localhost:8080/prices/lowest/ETHUSDT
+
+# Last minute
+curl http://localhost:8080/prices/lowest/ETHUSDT?period=1m
+```
+
+**Average Price**
+```bash
+# All time
+curl http://localhost:8080/prices/average/SOLUSDT
+
+# Last 3 minutes from specific exchange
+curl http://localhost:8080/prices/average/exchange2/SOLUSDT?period=3m
+```
+
+### System Endpoints
+
+**Health Check**
+```bash
+curl http://localhost:8080/health
+```
+
+**Mode Switching**
+```bash
+# Test Mode
+curl -X POST http://localhost:8080/mode/test
+
+# Live Mode
+curl -X POST http://localhost:8080/mode/live
+```
+
+## 🏗️ Architecture
+
+### Hexagonal Architecture
+
+```
+┌─────────────────────────────────────────┐
+│           HTTP Handlers (API)           │
+│          (Web Adapter)                  │
+└─────────────┬───────────────────────────┘
+              │
+┌─────────────▼───────────────────────────┐
+│      Application Layer (Use Cases)      │
+│  - Price Processing                     │
+│  - Data Aggregation                     │
+│  - Mode Switching                       │
+└─────────────┬───────────────────────────┘
+              │
+┌─────────────▼───────────────────────────┐
+│         Domain Layer (Models)           │
+│  - Price, Exchange, Pair                │
+└─────────────┬───────────────────────────┘
+              │
+    ┌─────────┴─────────┐
+    │                   │
+┌───▼──────┐      ┌─────▼────────┐
+│PostgreSQL│      │    Redis     │
+│ Adapter  │      │   Adapter    │
+└──────────┘      └──────────────┘
+```
+
+### Concurrency Patterns
+
+**Fan-Out Pattern**
+- Distribute data from one source to multiple workers
+
+**Fan-In Pattern**
+- Aggregate data from multiple sources into one channel
+
+**Worker Pool**
+- Pool of 5 workers per exchange for data processing
+
+**Generator**
+- Synthetic data generator for Test Mode
+
+## 💾 Data Storage
+
+### Redis (Cache)
+
+Store latest prices for the last minute for each pair from each exchange.
+
+**Key structure:**
+```
+price:{exchange}:{pair}:{timestamp}
+```
+
+### PostgreSQL (Database)
+
+Aggregated data per minute.
+
+**Table: market_data**
+```sql
+CREATE TABLE market_data (
+    id SERIAL PRIMARY KEY,
+    pair_name VARCHAR(20) NOT NULL,
+    exchange VARCHAR(50) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    average_price DECIMAL(20, 8) NOT NULL,
+    min_price DECIMAL(20, 8) NOT NULL,
+    max_price DECIMAL(20, 8) NOT NULL
+);
+```
+
+## 📝 Usage Examples
+
+```bash
+# Start in Live Mode
+./marketflow --port 8080
+
+# Health check
+curl http://localhost:8080/health
+
+# Get latest BTC price
+curl http://localhost:8080/prices/latest/BTCUSDT
+
+# Get highest ETH price for last 5 minutes
+curl http://localhost:8080/prices/highest/ETHUSDT?period=5m
+
+# Switch to Test Mode
+curl -X POST http://localhost:8080/mode/test
+
+# Get average SOL price from exchange1
+curl http://localhost:8080/prices/average/exchange1/SOLUSDT
+```
+
+## 🔧 Error Handling
+
+- **Automatic reconnection** when connection to exchange is lost
+- **Fallback mechanism**: if Redis is unavailable, data is saved to PostgreSQL
+- **Graceful degradation**: system continues operation during partial failures
+- **Write batching**: group operations for performance optimization
+
+## 🎓 Learning Objectives
+
+This project demonstrates:
+- Concurrent programming in Go
+- Concurrency patterns (Fan-in, Fan-out, Worker Pool, Generator)
+- Real-time stream data processing
+- Redis caching
+- PostgreSQL data storage
+- Hexagonal Architecture
+- REST API design
+- Graceful Shutdown
+
+## 📚 References
+
+- [Go Concurrency Patterns](https://go.dev/blog/pipelines)
+- [Redis Documentation](https://redis.io/docs/)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
+- [Hexagonal Architecture](https://alistair.cockburn.us/hexagonal-architecture/)
+
+## 🙏 Project Author
+
+**Savva Savostyanov**
+- Email: savvax@savvax.com
+- [GitHub](https://github.com/savvax)
 - [LinkedIn](https://www.linkedin.com/in/savvax/)
+
+---
